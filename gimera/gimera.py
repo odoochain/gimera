@@ -1,4 +1,6 @@
+# -*- coding: utf-8 -*-
 #!/usr/bin/env python3
+
 from ctypes.wintypes import PUSHORT
 import tempfile
 from contextlib import contextmanager
