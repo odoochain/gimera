@@ -3,13 +3,14 @@ import click
 import shutil
 from .gitcommands import GitCommands
 from pathlib import Path
-from .tools import yieldlist, X, safe_relative_to, _raise_error
+from .tools import yieldlist, X, safe_relative_to, _raise_error, rmtree
+from .consts import gitcmd as git
+from contextlib import contextmanager
 
 
 class Repo(GitCommands):
     def __init__(self, path):
         self.path = Path(path)
-        self.working_dir = Path(path)
 
     def __repr__(self):
         return f"{self.path}"
@@ -21,7 +22,7 @@ class Repo(GitCommands):
     def rel_path_to_root_repo(self):
         assert str(self.path).startswith("/")
         return self.path.relative_to(self.root_repo.path)
-    
+
     @property
     def root_repo(self):
         path = self.path
@@ -31,9 +32,10 @@ class Repo(GitCommands):
             path = path.parent
         else:
             return None
+
     @property
     def _git_path(self):
-        return (self.path / ".git")
+        return self.path / ".git"
 
     def ls_files_states(self, params):
         """
@@ -129,6 +131,14 @@ class Repo(GitCommands):
             splitted = line.strip().split(" ")
             yield Submodule(self.next_module_root / splitted[1], self.next_module_root)
 
+    def check_ignore(self, path):
+        try:
+            self.X("git", "check-ignore", "-q", path, allow_error=False)
+        except subprocess.CalledProcessError:
+            return False
+        else:
+            return True
+
     def _fix_to_remove_subdirectories(self, config):
         # https://stackoverflow.com/questions/4185365/no-submodule-mapping-found-in-gitmodule-for-a-path-thats-not-a-submodule
         # commands may block
@@ -220,7 +230,8 @@ class Repo(GitCommands):
         self.X("git", "clean", "-xdff")
 
     def please_no_staged_files(self):
-        if not (staged := self.staged_files):
+        staged = self.staged_files
+        if not staged:
             return
         _raise_error(
             "For the operation there mustnt be " f"any staged files like {staged}"
@@ -275,7 +286,7 @@ class Repo(GitCommands):
                 check = check.parent
                 continue
             if not list(check.iterdir()):
-                shutil.rmtree(check)
+                rmtree(check)
             check = check.parent
             if not safe_relative_to(check, self.path):
                 break
@@ -306,8 +317,7 @@ class Repo(GitCommands):
                 )
 
     def submodule_add(self, branch, url, rel_path):
-        commands = [
-            "git",
+        commands = git + [
             "submodule",
             "add",
             "--force",
@@ -321,7 +331,7 @@ class Repo(GitCommands):
         except subprocess.CalledProcessError:
             self._remove_internal_submodule_clone(self.rel_path_to_root_repo / rel_path)
             if (self.path / rel_path).exists():
-                shutil.rmtree(self.path / rel_path)
+                rmtree(self.path / rel_path)
             self.out(*commands)
 
     def _remove_internal_submodule_clone(self, rel_path_to_root):
@@ -334,7 +344,7 @@ class Repo(GitCommands):
                 # kill
                 next_path = root / part
                 if next_path.exists():
-                    shutil.rmtree(next_path)
+                    rmtree(next_path)
                 else:
                     _raise_error(
                         f"Could not delete submodule {part} in {root} - not found"
@@ -346,6 +356,15 @@ class Repo(GitCommands):
                     root = next_path
                 else:
                     _raise_error(f"Could not find submodule in .git for {part}")
+
+    @contextmanager
+    def stay_at_commit(self, enabled):
+        commit = self.hex
+        try:
+            yield
+        finally:
+            if enabled:
+                self.X("git", "reset", "--soft", commit)
 
 
 class Remote(object):

@@ -10,10 +10,11 @@ class GitCommands(object):
     @property
     def configdir(self):
         from .repo import Repo
+
         stop_at = Repo(self.path).root_repo
         here = self.path
         while True:
-            default = here / '.git'
+            default = here / ".git"
             if default.exists() and default.is_dir():
                 return default
             if default.is_file():
@@ -49,7 +50,8 @@ class GitCommands(object):
             if path.startswith(".."):
                 continue
             path = Path(path.strip())
-            if parent_path := getattr(self, "parent_path", None):
+            parent_path = getattr(self, "parent_path", None)
+            if parent_path:
                 path = parent_path / path
             else:
                 path = self.path / path
@@ -129,7 +131,7 @@ class GitCommands(object):
 
     def simple_commit_all(self, msg="."):
         self.X("git", "add", ".")
-        self.X("git", "commit", "-am", msg)
+        self.X("git", "commit", "--allow-empty","-am", msg)
 
     @property
     def hex(self):
