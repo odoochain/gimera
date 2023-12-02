@@ -1,15 +1,15 @@
+import os
+import shutil
 import subprocess
+import sys
 import tempfile
 import time
-from datetime import datetime
-import shutil
 import uuid
-import os
-from pathlib import Path
-import click
-import sys
-from curses import wrapper
 from contextlib import contextmanager
+from datetime import datetime
+from pathlib import Path
+
+import click
 
 
 def yieldlist(method):
