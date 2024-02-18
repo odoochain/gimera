@@ -126,6 +126,24 @@ class Config(object):
         if main_repo.staged_files:
             main_repo.X("git", "commit", "-m", "auto update gimera.yml")
 
+    def get_repos(self, names):
+        if not names:
+            return self.repos
+        if isinstance(names, (Path,str)) :
+            names = [names]
+        names = list(_strip_paths(names))
+        res = []
+
+        for item in self.repos:
+            if not item.enabled:
+                continue
+            if str(item.path) in names:
+                res.append(item)
+                names.remove(str(item.path))
+        if names:
+            _raise_error(f"Invalid path: {','.join(names)}")
+        return res
+
     class RepoItem(object):
         def __init__(self, config, config_section):
             """ """
@@ -216,13 +234,17 @@ class Config(object):
                 "patches": self.patches,
                 "type": self._type,
                 "url": self._url,
-                "merges": self._merges,
+                "merges": self.merges,
                 "remotes": self._remotes,
             }
 
         @property
         def url(self):
             return self._url
+
+        @url.setter
+        def url(self, value):
+            self._url = value
 
         @property
         def url_public(self):
@@ -234,6 +256,10 @@ class Config(object):
             if self.config.force_type:
                 return self.config.force_type
             return self._type
+
+        @type.setter
+        def type(self, value):
+            self._type = value
 
         def all_patch_dirs(self, rel_or_abs=None):
             if not rel_or_abs:

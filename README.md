@@ -129,7 +129,7 @@ gimera apply <path> -I --update
 
 ## Deliver Patches with reused submodules.
 
-In the su-bmodule:
+In the submodule:
 ```yaml
 gimera.yml
 
@@ -155,6 +155,30 @@ After that a recursive gimera is required.
 gimera apply -r
 ```
 
+### Note:
+
+This way is ok for small sized patches. If patches grow and grow one useful recommendation is to use
+github workflows to rebase version branches from main automatically again and apply all changes.
+
+This is a sample workflow github:
+```
+name: Deploy fixes to other versions with rebase main
+
+on:
+  push:
+    branches:
+      - main
+
+permissions: write-all
+
+jobs:
+  deploy-subversions:
+    uses: Odoo-Ninjas/git-workflows/.github/workflows/deploy_to_subversions.yml@v1
+    with:
+      branches: "11.0 12.0 13.0 14.0 15.0 16.0"
+```
+
+
 # Demo Videos
 
 ## Edit existing patch file and update it
@@ -162,9 +186,23 @@ gimera apply -r
 [![Patching Gimera]](https://youtu.be/WQU9db5z9IY)
 
 
+## gimera commit command
 
+Case: you change code inside an integrated submodule and want to easily commit this.
+Just do
+
+```
+git commit path branch message
+```
+
+How it works:
+  * a patch file is created
+  * the repo is cloned
+  * patch file is applied
+  * if something conflicts, then it is reported and you have to decide what to do
 
 ## Contributors
+  * Marc Wimmer (marc@zebroo.de)
   * Michael Tietz (mtietz@mt-software.de)
   * Walter Saltzmann
 

@@ -6,11 +6,13 @@ from pathlib import Path
 from .tools import yieldlist, X, safe_relative_to, _raise_error, rmtree
 from .consts import gitcmd as git
 from contextlib import contextmanager
+from .tools import is_forced
 
 
 class Repo(GitCommands):
     def __init__(self, path):
         self.path = Path(path)
+        self.is_submodule = False
 
     def __repr__(self):
         return f"{self.path}"
@@ -26,12 +28,11 @@ class Repo(GitCommands):
     @property
     def root_repo(self):
         path = self.path
-        for i in path.parts:
+        for _ in path.parts:
             if (path / ".git").is_dir():
                 return Repo(path)
             path = path.parent
-        else:
-            return None
+        return None
 
     @property
     def _git_path(self):
@@ -62,14 +63,15 @@ class Repo(GitCommands):
         self.please_no_staged_files()
 
         # if there are dirty files, then abort to not destroy data
-        dirty_files = self.ls_files_states(["-dmok"])
         dirty_files = list(
             filter(
-                lambda file: not file.is_dir()
-                and safe_relative_to(self.path / file, self.path / path),
-                dirty_files,
+                lambda file: safe_relative_to(self.path / file, self.path / path),
+                self.all_dirty_files,
             )
         )
+        if dirty_files:
+            if not is_forced():
+                _raise_error(f"Path is dirty: {path}. Changes would be lost.")
         fullpath = self.path / path
         if fullpath.exists():
             self.X(
@@ -328,7 +330,7 @@ class Repo(GitCommands):
         ]
         try:
             self.out(*commands)
-        except subprocess.CalledProcessError:
+        except subprocess.CalledProcessError as ex:
             self._remove_internal_submodule_clone(self.rel_path_to_root_repo / rel_path)
             if (self.path / rel_path).exists():
                 rmtree(self.path / rel_path)
@@ -379,6 +381,20 @@ class Submodule(Repo):
         self.path = Path(path)
         self.parent_path = Path(parent_path)
         self.relpath = self.path.relative_to(self.parent_path)
+        self.is_submodule = True
+
+    @property
+    def is_git_submodule(self):
+        gitmodules = self.parent_path / ".gitmodules"
+        if not gitmodules.exists():
+            return False
+        module = [
+            x
+            for x in gitmodules.read_text().splitlines()
+            if x.startswith("[submodule")
+            if f'"{self.relpath}"]' in x
+        ]
+        return bool(module)
 
     def __repr__(self):
         return f"{self.path}"

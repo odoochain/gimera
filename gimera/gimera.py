@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import threading
 import time
 import tempfile
 import re
@@ -26,6 +27,8 @@ from .config import Config
 from .patches import make_patches
 from .patches import _apply_patches
 from .patches import _apply_patchfile
+from .patches import _technically_make_patch
+from .tools import is_forced
 
 
 @click.group()
@@ -34,16 +37,20 @@ def cli():
 
 
 def _expand_repos(repos):
-    config = Config()
-    for repo in repos:
-        if "*" not in repo:
-            yield repo
-        repo = repo.replace("*", ".*")
-        for candi in config.repos:
-            if not candi.enabled:
-                continue
-            if re.findall(repo, str(candi.path)):
-                yield str(candi.path)
+    def unique():
+        config = Config()
+        for repo in repos:
+            if "*" not in repo:
+                yield repo
+            repo = repo.replace("*", ".*")
+            for candi in config.repos:
+                if not candi.enabled:
+                    continue
+                if re.findall(repo, str(candi.path)):
+                    yield str(candi.path)
+
+    res = list(set(unique()))
+    return res
 
 
 @cli.command(name="clean", help="Removes all dirty")
@@ -71,26 +78,15 @@ def combine_patches():
 
 
 def _get_available_repos(ctx, param, incomplete):
-    config = Config(force_type=False)
     repos = []
 
-    if "*" in incomplete:
-        repos = _expand_repos(list(incomplete))
+    if "/" in incomplete:
+        incomplete = incomplete.replace("/", "/*") + "*"
+    else:
+        incomplete = "*" + incomplete + "*"
 
-    for repo in config.repos:
-        if not repo.enabled:
-            continue
-        if not repo.path:
-            continue
+    repos = list(_expand_repos([incomplete]))
 
-        if incomplete:
-            if "/" not in incomplete:
-                if incomplete not in str(repo.path):
-                    continue
-            else:
-                if not str(repo.path).startswith(incomplete):
-                    continue
-        repos.append(str(repo.path))
     return sorted(repos)
 
 
@@ -188,6 +184,12 @@ def _get_available_patchfiles(ctx, param, incomplete):
     is_flag=True,
     help="",
 )
+@click.option(
+    "-f",
+    "--force",
+    is_flag=True,
+    help="",
+)
 def apply(
     repos,
     update,
@@ -201,7 +203,10 @@ def apply(
     remove_invalid_branches,
     non_interactive,
     no_auto_commit,
+    force,
 ):
+    if force:
+        os.environ["GIMERA_FORCE"] = "1"
     if non_interactive:
         os.environ["GIMERA_NON_INTERACTIVE"] = "1"
     if all_integrated and all_submodule:
@@ -246,12 +251,7 @@ def _apply(
     """
     config = Config(force_type=force_type, recursive=recursive)
 
-    repos = list(_strip_paths(repos))
-    for check in repos:
-        if check not in map(
-            lambda x: str(x.path), filter(lambda x: x.enabled, config.repos)
-        ):
-            _raise_error(f"Invalid path: {check}")
+    repos = config.get_repos(repos)
 
     _internal_apply(
         repos,
@@ -264,6 +264,15 @@ def _apply(
         remove_invalid_branches=remove_invalid_branches,
         auto_commit=auto_commit,
     )
+
+
+def _get_main_repo():
+    # main_repo = Repo(os.getcwd())
+    path = Path(os.getcwd())
+    while (path.parent / ".git").exists() and (path.parent / ".git").is_dir():
+        path = path.parent
+
+    return Repo(path)
 
 
 def _internal_apply(
@@ -280,19 +289,18 @@ def _internal_apply(
     **options,
 ):
     common_vars = common_vars or {}
-    main_repo = Repo(os.getcwd())
+    main_repo = _get_main_repo()
     config = Config(
         force_type=force_type,
         recursive=recursive,
         common_vars=common_vars,
         parent_config=parent_config,
     )
+
+    # update repos in parallel to be faster
+    _fetch_repos_in_parallel(main_repo, repos, update=update)
     with main_repo.stay_at_commit(not auto_commit):
-        for repo in config.repos:
-            if not repo.enabled:
-                continue
-            if repos and str(repo.path) not in repos:
-                continue
+        for repo in repos:
             _turn_into_correct_repotype(main_repo, repo, config)
             if repo.type == REPO_TYPE_SUB:
                 _make_sure_subrepo_is_checked_out(main_repo, repo)
@@ -311,7 +319,9 @@ def _internal_apply(
                         main_repo, repo, update, parallel_safe, **options
                     )
                 except Exception as ex:
-                    msg = f"Error updating integrated submodules for: {repo.path}\n\n{ex}"
+                    msg = (
+                        f"Error updating integrated submodules for: {repo.path}\n\n{ex}"
+                    )
                     _raise_error(msg)
 
                 if not strict:
@@ -334,6 +344,34 @@ def _internal_apply(
                     auto_commit=auto_commit,
                     **options,
                 )
+
+
+def _fetch_repos_in_parallel(main_repo, repos, update=None):
+    results = {"errors": {}, "urls": set()}
+
+    def _pull_repo(index, main_repo, repo_yml):
+        try:
+            if repo_yml.url in results["urls"]:
+                return
+            results["urls"].add(repo_yml.url)
+            local_repo_dir = _get_cache_dir(main_repo, repo_yml)
+            with wait_git_lock(local_repo_dir):
+                repo = Repo(local_repo_dir)
+                _fetch_and_reset_branch(repo, repo_yml)
+
+        except Exception as ex:
+            results["errors"][index] = ex
+
+    threads = []
+    for index, repo in enumerate(repos):
+        t = threading.Thread(target=_pull_repo, args=(index, main_repo, repo))
+        t.daemon = True
+        threads.append(t)
+    [x.start() for x in threads]
+    [x.join() for x in threads]
+
+    if results["errors"]:
+        raise Exception(results["errors"])
 
 
 def _apply_subgimera(
@@ -384,11 +422,13 @@ def _make_sure_subrepo_is_checked_out(main_repo, repo_yml):
     path = main_repo.path / repo_yml.path
     if path.exists() and not is_empty_dir(path):
         return
-    main_repo.X(
-        *(git + ["submodule", "update", "--init", "--recursive", repo_yml.path])
-    )
+    with _temporary_switch_remote_to_cachedir(main_repo, repo_yml):
+        main_repo.X(*(git + ["submodule", "update", "--init", "--recursive", path]))
+
     if not path.exists():
-        _raise_error("After submodule update the path {repo_yml['path']} did not exist")
+        _raise_error(
+            f"After submodule update the path {repo_yml['path']} did not exist"
+        )
 
 
 def _get_cache_dir(main_repo, repo_yml):
@@ -429,28 +469,8 @@ def _update_integrated_module(
         if not os.access(local_repo_dir, os.W_OK):
             _raise_error(f"No R/W rights on {local_repo_dir}")
         repo = Repo(local_repo_dir)
-        repo.X("git", "remote", "set-url", "origin", repo_yml.url)
-        repo.X("git", "fetch", "--all")
-        branch = str(repo_yml.branch)
-        origin_branch = f"origin/{branch}"
-        try:
-            repo.X("git", "checkout", "-f", branch)
-        except subprocess.CalledProcessError:
-            if options.get("remove_invalid_branches"):
-                repo_yml.drop_dead()
-                click.secho(
-                    f"Branch {branch} did not exist in {repo_yml.path}; it is removed.",
-                    fg="yellow",
-                )
-            else:
-                click.secho(
-                    f"Branch {branch} does not exist in {repo_yml.path}", fg="red"
-                )
-            return
-        repo.X("git", "reset", "--hard", origin_branch)
-        repo.X("git", "branch", f"--set-upstream-to={origin_branch}", branch)
-        repo.X("git", "clean", "-xdff")
-        repo.pull(repo_yml=repo_yml)
+        # no_fetch - because everything was pulled in parallel step before
+        _fetch_and_reset_branch(repo, repo_yml, no_fetch=True, **options)
 
         if not update and repo_yml.sha:
             branches = repo.get_all_branches()
@@ -630,6 +650,7 @@ def _fetch_latest_commit_in_submodule(main_repo, repo_yml, update=False):
     if not path.exists():
         return
     subrepo = main_repo.get_submodule(repo_yml.path)
+    cache_dir = _get_cache_dir(main_repo, repo_yml)
     if subrepo.dirty:
         _raise_error(
             f"Directory {repo_yml.path} contains modified "
@@ -656,25 +677,26 @@ def _fetch_latest_commit_in_submodule(main_repo, repo_yml, update=False):
             )
         sha_of_branch = subrepo.out("git", "rev-parse", repo_yml.branch).strip()
         if sha_of_branch == sha:
-            subrepo.X("git", "checkout", "-f", repo_yml.branch)
+            subrepo.X(*(git + ["checkout", "-f", repo_yml.branch]))
         else:
-            subrepo.X("git", "checkout", "-f", sha)
+            subrepo.X(*(git + ["checkout", "-f", sha]))
     else:
         try:
-            subrepo.X("git", "checkout", "-f", repo_yml.branch)
+            subrepo.X(*(git + ["checkout", "-f", repo_yml.branch]))
         except Exception:  # pylint: disable=broad-except
             _raise_error(f"Failed to checkout {repo_yml.branch} in {path}")
         else:
             _commit_submodule_inside_clean_but_not_linked_to_parent(main_repo, subrepo)
 
-    subrepo.X("git", "submodule", "update", "--init", "--recursive")
+    subrepo.X(*(git + ["submodule", "update", "--init", "--recursive"]))
     _commit_submodule_inside_clean_but_not_linked_to_parent(main_repo, subrepo)
 
     # check if sha collides with branch
-    subrepo.X("git", "clean", "-xdff")
+    subrepo.X(*(git + ["clean", "-xdff"]))
     if not repo_yml.sha or update:
-        subrepo.X("git", "checkout", "-f", repo_yml.branch)
-        subrepo.pull(repo_yml=repo_yml)
+        subrepo.X(*(git + ["checkout", "-f", repo_yml.branch]))
+        with _temporary_switch_remote_to_cachedir(main_repo, repo_yml):
+            subrepo.pull(repo_yml=repo_yml)
         _commit_submodule_inside_clean_but_not_linked_to_parent(main_repo, subrepo)
 
     # update gimera.yml on demand
@@ -702,6 +724,17 @@ def __add_submodule(repo, config, all_config):
             repo.output_status()
             repo.please_no_staged_files()
             # remove current path
+
+            dirty_files = [
+                x
+                for x in repo.all_dirty_files
+                if safe_relative_to(x, repo.path / relpath)
+            ]
+            if dirty_files:
+                if not is_forced():
+                    _raise_error(
+                        f"Dirty files exist in {repo.path / relpath}. Changes would be lost."
+                    )
 
             if repo.lsfiles(relpath):
                 repo.X("git", "rm", "-f", "-r", relpath)
@@ -742,8 +775,10 @@ def __add_submodule(repo, config, all_config):
         repo.X("git", "rm", "-rf", relpath)
         rmtree(repo.path / relpath)
 
-    repo.submodule_add(config.branch, config.url, relpath)
-    # repo.X("git", "add", ".gitmodules", relpath)
+    cache_dir = _get_cache_dir(repo, config)
+    repo.submodule_add(config.branch, f"file://{cache_dir}", relpath)
+    repo.X(*(git + ["submodule", "set-url", relpath, config.url]))
+    repo.X(*(git + ["add", ".gitmodules"]))
     click.secho(f"Added submodule {relpath} pointing to {config.url}", fg="yellow")
     if repo.staged_files:
         repo.X("git", "commit", "-m", f"gimera added submodule: {relpath}")
@@ -949,3 +984,84 @@ def status():
     repos = list(_get_missing_repos(config))
     for repo in repos:
         click.secho(f"Missing: {repo.path}", fg="red")
+
+
+def _fetch_and_reset_branch(repo, repo_yml, no_fetch=False, **options):
+    repo.X("git", "remote", "set-url", "origin", repo_yml.url)
+    if not no_fetch:
+        repo.X("git", "fetch", "--all")
+    branch = str(repo_yml.branch)
+    origin_branch = f"origin/{branch}"
+    try:
+        repo.X("git", "checkout", "-f", branch)
+    except subprocess.CalledProcessError:
+        if options.get("remove_invalid_branches"):
+            repo_yml.drop_dead()
+            click.secho(
+                f"Branch {branch} did not exist in {repo_yml.path}; it is removed.",
+                fg="yellow",
+            )
+        else:
+            click.secho(f"Branch {branch} does not exist in {repo_yml.path}", fg="red")
+        return
+    repo.X("git", "reset", "--hard", origin_branch)
+    repo.X("git", "branch", f"--set-upstream-to={origin_branch}", branch)
+    repo.X("git", "clean", "-xdff")
+
+
+@contextmanager
+def _temporary_switch_remote_to_cachedir(main_repo, repo_yml):
+    cache_dir = _get_cache_dir(main_repo, repo_yml)
+    main_repo.X(*(git + ["submodule", "set-url", repo_yml.path, f"file://{cache_dir}"]))
+    try:
+        yield
+    finally:
+        main_repo.X(*(git + ["submodule", "set-url", repo_yml.path, repo_yml.url]))
+
+
+@cli.command(
+    name="commit", help="Collects changes and commits them to the specified branch."
+)
+@click.argument(
+    "repo", default=None, shell_complete=_get_available_repos, required=True
+)
+@click.argument("message", required=True)
+@click.option(
+    "-p",
+    "--preview",
+    is_flag=True,
+)
+@click.argument("branch", required=True)
+def commit(repo, branch, message, preview):
+    return _commit(repo, branch, message, preview)
+
+def _commit(repo, branch, message, preview):
+    config = Config()
+    repo = config.get_repos(Path(repo))
+    path2 = Path(tempfile.mktemp(suffix="."))
+    main_repo = _get_main_repo()
+    assert len(repo) == 1
+    repo = repo[0]
+
+    with prepare_dir(path2) as path2:
+        path2 = path2 / "repo"
+        gitrepo = Repo(path2)
+        main_repo.X("git", "clone", repo.url, path2)
+        gitrepo.X("git", "checkout", "-f", branch)
+        src_path = main_repo.path / repo.path
+        patch_content = _technically_make_patch(main_repo, src_path)
+
+        patchfile = gitrepo.path / "1.patch"
+        patchfile.write_text(patch_content)
+
+        _apply_patchfile(patchfile, gitrepo.path, error_ok=False)
+
+        patchfile.unlink()
+        gitrepo.X("git", "add", ".")
+        if preview:
+            gitrepo.X("git", "diff")
+            doit = inquirer.confirm("Commit this?", default=True)
+            if not doit:
+                return
+        gitrepo.X("git", "commit", "-m", message)
+        gitrepo.X("git", "push")

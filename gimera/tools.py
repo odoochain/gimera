@@ -11,6 +11,9 @@ from pathlib import Path
 
 import click
 
+def is_forced():
+    return os.getenv("GIMERA_FORCE", "0") == "1"
+
 
 def yieldlist(method):
     def wrapper(*args, **kwargs):
