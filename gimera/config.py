@@ -5,27 +5,43 @@ import yaml
 import os
 from contextlib import contextmanager
 from .repo import Repo, Remote
+from .consts import gitcmd as git
 from .tools import (
     _raise_error,
-    safe_relative_to,
-    is_empty_dir,
     _strip_paths,
     remember_cwd,
 )
 from .consts import REPO_TYPE_INT, REPO_TYPE_SUB
 
 
-class Patchdir(object):
-    def __init__(self, path, apply_from_here_dir):
+class PatchDir(object):
+    def __init__(self, repo_item, path, chdir):
         """
         Internal patches must be applied starting from subfolder.
         Patches from the main repo must be applied starting from parent main folder.
         """
+        self.repo_item = repo_item
+        self.config = repo_item.config
         self._path = Path(path)
-        self.apply_from_here_dir = apply_from_here_dir
+        self.chdir = chdir
+
+    @property
+    def apply_from_here_dir(self):
+        if self.chdir:
+            return self._get_absolute_path(self.chdir)
+        return self._get_absolute_path(self.repo_item.path)
 
     def __str__(self):
         return f"{self._path}"
+
+    def _get_absolute_path(self, path):
+        path = Path(path)
+        root = self.config.config_file.parent
+        return root / path
+
+    @property
+    def path_absolute(self):
+        return self._get_absolute_path(self._path)
 
     @property
     @contextmanager
@@ -36,16 +52,25 @@ class Patchdir(object):
                 path = self.apply_from_here_dir
             yield path
 
+    def as_dict(self):
+        d = {
+            "path": str(self._path),
+        }
+        if self.chdir:
+            d['chdir'] = str(self.chdir)
+        return d
 
 class Config(object):
     def __init__(
-        self, force_type=None, recursive=False, common_vars=None, parent_config=None
+        self, force_type=None, recursive=False, common_vars=None, parent_config=None,
+        force_gimera_file=None,
     ):
         self.force_type = force_type
         self._repos = []
         self.recursive = recursive
         self.parent_common_vars = common_vars
         self.parent_config = parent_config
+        self.force_gimera_file = force_gimera_file
         self.load_config()
 
     @property
@@ -67,12 +92,15 @@ class Config(object):
     #     return p.config_file.parent
 
     def _get_config_file(self):
+        if self.force_gimera_file:
+            return self.force_gimera_file
         config_file = Path(os.getcwd()) / "gimera.yml"
         if not config_file.exists():
             _raise_error(f"Did not find: {config_file}")
         return config_file
 
     def load_config(self):
+        self._repos = []
         self.config_file = self._get_config_file()
 
         self.yaml_config = yaml.load(
@@ -103,18 +131,30 @@ class Config(object):
         if main_repo.staged_files:
             _raise_error("There mustnt be any staged files when updating gimera.yml")
 
+        if 'patches' in value:
+            for path in value['patches']:
+                if isinstance(path, str):
+                    raise Exception("Please use PatchDir object now.")
+
         config = yaml.load(self.config_file.read_text(), Loader=yaml.FullLoader)
         param_repo = repo
         for repo in config["repos"]:
             if Path(repo["path"]) == param_repo.path:
                 for k, v in value.items():
+                    if k == "sha":
+                        v = str(v)
+                    elif k == 'patches':
+                        v = [x.as_dict() for x in v]
                     repo[k] = v
                 break
         else:
             config["repos"].append(value)
         for k, v in value.items():
+            if k == 'patches':
+                continue
             try:
-                setattr(param_repo, k, v)
+                if getattr(param_repo, k) != v:
+                    setattr(param_repo, k, v)
             except AttributeError as ex:
                 raise Exception(f"Cannot set attribute {k}") from ex
         self.config_file.write_text(yaml.dump(config, default_flow_style=False))
@@ -122,20 +162,52 @@ class Config(object):
         if self.config_file.resolve() in [
             x.resolve() for x in main_repo.all_dirty_files
         ]:
-            main_repo.X("git", "add", self.config_file)
+            main_repo.X(*(git + ["add", self.config_file]))
         if main_repo.staged_files:
-            main_repo.X("git", "commit", "-m", "auto update gimera.yml")
+            cmd = ["commit", "-m", "auto update gimera.yml", "--no-verify"]
+            main_repo.X(*(git + cmd))
+
+    def get_repos(self, names):
+        if not names:
+            return self.repos
+        if isinstance(names, (Path, str)):
+            names = [names]
+        names = list(_strip_paths(names))
+        res = []
+
+        for item in self.repos:
+            if not item.enabled:
+                continue
+            if str(item.path) in names:
+                res.append(item)
+                names.remove(str(item.path))
+        if names:
+            _raise_error(f"Invalid path: {','.join(names)}")
+        return res
 
     class RepoItem(object):
+        def parse_patches(self, patches_section):
+            result = []
+            for item in patches_section:
+                if isinstance(item, str):
+                    item = PatchDir(self, item, None)
+                elif isinstance(item, dict):
+                    item = PatchDir(self, Path(item["path"]), Path(item.get("chdir")) if item.get("chdir") else None)
+                else:
+                    _raise_error(f"Invalid patch definition: {item}")
+                result.append(item)
+            return result
+
         def __init__(self, config, config_section):
             """ """
             self.config = config
             self._sha = config_section.get("sha", None)
             self.enabled = config_section.get("enabled", True)
+            self.freeze_sha = config_section.get("freeze_sha", False)
             self.path = Path(config_section["path"])
             self.branch = self.eval(str(config_section["branch"]))
             self.merges = config_section.get("merges", [])
-            self.patches = config_section.get("patches", [])
+            self.patches = self.parse_patches(config_section.get("patches", []))
             self.ignored_patchfiles = config_section.get("ignored_patchfiles", [])
             self.edit_patchfile = config_section.get("edit_patchfile", "")
             self._type = config_section["type"]
@@ -203,26 +275,28 @@ class Config(object):
 
         @sha.setter
         def sha(self, value):
-            changed = False
-            changed = self._sha != value
             self._sha = value
-            if changed:
+            if not self.freeze_sha and os.getenv("GIMERA_NO_SHA_UPDATE") != "1":
                 self.config._store(self, {"sha": value})
 
         def as_dict(self):
             return {
                 "path": self.path,
                 "branch": self.branch,
-                "patches": self.patches,
+                "patches": [x.as_dict() for x in self.patches],
                 "type": self._type,
                 "url": self._url,
-                "merges": self._merges,
+                "merges": self.merges,
                 "remotes": self._remotes,
             }
 
         @property
         def url(self):
             return self._url
+
+        @url.setter
+        def url(self, value):
+            self._url = value
 
         @property
         def url_public(self):
@@ -235,47 +309,17 @@ class Config(object):
                 return self.config.force_type
             return self._type
 
-        def all_patch_dirs(self, rel_or_abs=None):
-            if not rel_or_abs:
-                raise ValueError("Please define rel_or_abs")
-
-            def transform_outbound_patchdirs(dir):
-                patch_path = Path(dir)
-                apply_from_here = self.config.parent_path / self.path
-                if rel_or_abs == "absolute":
-                    root = self.config.config_file.parent
-                    patch_path = root / patch_path
-                    apply_from_here = root / apply_from_here
-                dir = Patchdir(patch_path, apply_from_here)
-                return dir
-
-            res = list(map(transform_outbound_patchdirs, self.patches))
-
-            def transform_internal_patchdir(dir):
-                patch_path = Path(self.eval(str(dir)))
-                apply_from_here = self.path
-
-                if rel_or_abs == "absolute":
-                    root = self.config.config_file.parent
-                    patch_path = root / self.path / patch_path
-                    apply_from_here = root / apply_from_here
-                dir = Patchdir(patch_path, apply_from_here)
-                return dir
-
-            res += list(map(transform_internal_patchdir, self.internal_patch_dirs))
-            for test in res:
-                with test.path as testpath:
-                    if not (self.config.config_file.parent / testpath).exists():
-                        click.secho(f"Warning: not found: {test}", fg="yellow")
-            return res
+        @type.setter
+        def type(self, value):
+            self._type = value
 
         @property
         def fullpath(self):
             return self.config.config_file.parent / self.path
 
         def _get_type_of_patchfolder(self, path):
-            for test in self.patches:
-                if str(path).startswith(str(test)):
+            for patch_dir in self.patches:
+                if str(path).startswith(str(patch_dir._path)):
                     return "from_outside"
 
             for test in self.internal_patch_dirs:

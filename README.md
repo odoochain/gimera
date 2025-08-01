@@ -34,11 +34,19 @@ repos:
     - url: "https://github.com/foo/bar"
       branch: branch1_${VERSION}
       path: roles/sub1
-      patches: []
+      patches:
+        - patches/foo/bar
+      # patches can also be configures as dictionaries with extra infos:
+      patches:
+        - path: patches/foo/bar
+          chdir: foo  # if you get patch files from others you can switch the executing
+                      # current working directory
       type: submodule
 
       # default True
       enabled: True
+      # if true, then on gimera apply -u the SHA is not updated
+      freeze_sha: False
 
 
     # instead of submodule put the content directly in the repository;
@@ -127,46 +135,62 @@ You should call update to pull the latest version.
 gimera apply <path> -I --update
 ```
 
-## Recursive setup
+### Note:
 
-If you have your tools in git submodules and depending where you add your modules
-specific patches have to be applied, you can use the following structure. A concrete
-use case is for example odoo and using sub modules.
+This way is ok for small sized patches. If patches grow and grow one useful recommendation is to use
+github workflows to rebase version branches from main automatically again and apply all changes.
 
-So instead of creating a branch for 13.0 / 14.0 / 15.0 / 16.0 you just create the
-main branch and working on version 14.0 for example. Then you create patch dirs
-for each version.
+This is a sample workflow github:
+```
+name: Deploy fixes to other versions with rebase main
 
-In the submodule:
-```yaml
-gimera.yml
+on:
+  push:
+    branches:
+      - main
 
-common:
-  patches:
-    - patches/${VERSION}
+permissions: write-all
 
+jobs:
+  deploy-subversions:
+    uses: Odoo-Ninjas/git-workflows/.github/workflows/deploy_to_subversions.yml@v1
+    with:
+      branches: "11.0 12.0 13.0 14.0 15.0 16.0"
 ```
 
-The main gimera which integrates the submodule should be:
-```yaml
-common:
-  vars:
-    VERSION: 15.0
-repos:
-  type: integrated
-  url: .....
-  path: sub1
-```
-
-After that a recursive gimera is required.
-```
-gimera apply -r
-```
 
 # Demo Videos
 
 ## Edit existing patch file and update it
 
+[![Patching Gimera]](https://youtu.be/WQU9db5z9IY)
+
+
+## gimera commit command
+
+Case: you change code inside an integrated submodule and want to easily commit this.
+Just do
+
+```
+git commit path branch message
+```
+
+How it works:
+  * a patch file is created
+  * the repo is cloned
+  * patch file is applied
+  * if something conflicts, then it is reported and you have to decide what to do
+
+## Some environment variables
+
+  * GIMERA_NON_THREADED=1 - non threaded fetch
+  * GIMERA_IGNORE_FETCH_ERRORS=1 - ignore any fetch error at fetch
+  * GIMERA_NO_SHA_UPDATE=1 - no shas updated in gimera file
+  * GIMERA_QUIET=1 - rsyncing quiet and git
+  * GIMERA_NO_PRECOMMIT=1 - do not execute pre commits
+
+## Authors:
+  * Marc Wimmer (marc@zebroo.de)
 
 ## Contributors
   * Michael Tietz (mtietz@mt-software.de)

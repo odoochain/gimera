@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-import time
 import tempfile
 import re
 from contextlib import contextmanager
@@ -7,25 +6,20 @@ import os
 from datetime import datetime
 import inquirer
 import click
-import json
-import yaml
 import sys
-import subprocess
 from pathlib import Path
 from .repo import Repo, Remote
 from .gitcommands import GitCommands
-from .tools import _raise_error, safe_relative_to, is_empty_dir, _strip_paths
-from .tools import yieldlist
-from .tools import rsync
-from .consts import gitcmd as git
-from .tools import prepare_dir
-from .tools import wait_git_lock
-from .tools import rmtree
+from .tools import _raise_error
 from .consts import REPO_TYPE_INT, REPO_TYPE_SUB
 from .config import Config
-from .patches import make_patches
-from .patches import _apply_patches
-from .patches import _apply_patchfile
+from .patches import _get_available_patchfiles
+from .tools import try_rm_tree
+from .tools import _get_missing_repos
+from .tools import _get_main_repo
+from .apply import _apply
+from .commit import _commit
+from .patches import _edit_patch
 
 
 @click.group()
@@ -34,19 +28,28 @@ def cli():
 
 
 def _expand_repos(repos):
-    config = Config()
-    for repo in repos:
-        if "*" not in repo:
-            yield repo
-        repo = repo.replace("*", ".*")
-        for candi in config.repos:
-            if not candi.enabled:
-                continue
-            if re.findall(repo, str(candi.path)):
-                yield str(candi.path)
+    def unique():
+        config = Config()
+        for repo in repos:
+            if "*" not in repo:
+                if repo.endswith("/"):
+                    repo = repo[:-1]
+                yield repo
+            repo = repo.replace("*", ".*")
+            for candi in config.repos:
+                if not candi.enabled:
+                    continue
+                if re.findall(repo, str(candi.path)):
+                    yield str(candi.path)
+
+    res = list(set(unique()))
+    exact_match = [x for x in res if x in repos]
+    if len(exact_match) == 1:
+        return exact_match
+    return res
 
 
-@cli.command(name="clean", help="Removes all dirty")
+@cli.command(name="clean", help="Removes all git-dirty items")
 def clean():
     Cmd = GitCommands()
     if not Cmd.dirty:
@@ -71,50 +74,27 @@ def combine_patches():
 
 
 def _get_available_repos(ctx, param, incomplete):
-    config = Config(force_type=False)
     repos = []
 
-    if "*" in incomplete:
-        repos = _expand_repos(list(incomplete))
+    os.system(f"echo '{incomplete}' >> /tmp/gim")
 
-    for repo in config.repos:
-        if not repo.enabled:
-            continue
-        if not repo.path:
-            continue
-
-        if incomplete:
-            if "/" not in incomplete:
-                if incomplete not in str(repo.path):
-                    continue
-            else:
-                if not str(repo.path).startswith(incomplete):
-                    continue
-        repos.append(str(repo.path))
-    return sorted(repos)
-
-
-def _get_available_patchfiles(ctx, param, incomplete):
-    config = Config(force_type=False, recursive=True)
-    cwd = Path(os.getcwd())
-    patchfiles = []
-    filtered_patchfiles = []
-    for repo in config.repos:
-        if not repo.enabled:
-            continue
-        for patchdir in repo.all_patch_dirs(rel_or_abs="absolute"):
-            if not patchdir._path.exists():
-                continue
-            for file in patchdir._path.glob("*.patch"):
-                patchfiles.append(file.relative_to(cwd))
-    if incomplete:
-        for file in patchfiles:
-            if incomplete in str(file):
-                filtered_patchfiles.append(file)
+    if "/" in incomplete:
+        incomplete = incomplete.replace("/", "/*") + "*"
     else:
-        filtered_patchfiles = patchfiles
-    filtered_patchfiles = list(sorted(filtered_patchfiles))
-    return sorted(map(str, filtered_patchfiles))
+        incomplete = "*" + incomplete + "*"
+
+    repos = list(_expand_repos([incomplete]))
+    os.system(f"echo '{repos}' >> /tmp/gim")
+    repos = list(map(str, repos))
+
+    # repos = list(map(lambda x: '/'.join(x.split("/")[1:]), repos))
+    def remove_parts(x):
+        count = incomplete.count("/")
+        x = x.split("/")[count:]
+        return '/'.join(x)
+    repos = list(map(remove_parts, repos))
+
+    return sorted(repos)
 
 
 @cli.command(name="apply", help="Applies configuration from gimera.yml")
@@ -136,15 +116,6 @@ def _get_available_patchfiles(ctx, param, incomplete):
     "--all-submodule",
     is_flag=True,
     help="Overrides setting in gimera.yml and sets 'submodule' for all.",
-)
-@click.option(
-    "-p",
-    "--parallel-safe",
-    is_flag=True,
-    help=(
-        "In multi environments using the same cache directory this avoids "
-        "race conditions."
-    ),
 )
 @click.option(
     "-s",
@@ -170,6 +141,7 @@ def _get_available_patchfiles(ctx, param, incomplete):
     "-m",
     "--missing",
     is_flag=True,
+    help="Only updates paths, that dont exist yet in filesystem",
 )
 @click.option(
     "--remove-invalid-branches",
@@ -188,12 +160,57 @@ def _get_available_patchfiles(ctx, param, incomplete):
     is_flag=True,
     help="",
 )
+@click.option(
+    "-f",
+    "--force",
+    is_flag=True,
+    help="",
+)
+@click.option(
+    "-n",
+    "--no-fetch",
+    is_flag=True,
+    help="",
+)
+@click.option(
+    "-v",
+    "--verbose",
+    is_flag=True,
+    help="",
+)
+@click.option(
+    "-SHA",
+    "--no-sha-update",
+    is_flag=True,
+    help="If set, then in gimera.yml the shas are not updated.",
+)
+@click.option(
+    "-M",
+    "--migrate-changes",
+    is_flag=True,
+    help="Keeps changes to repo",
+)
+@click.option(
+    "--raise-exception",
+    is_flag=True,
+    help="Raises exception instead of exit of program",
+)
+@click.option(
+    "--do-not-apply-patches",
+    is_flag=True,
+    help="Do not apply patches",
+)
+@click.option(
+    "-PC",
+    "--no-precommits",
+    is_flag=True,
+    help="No precommits",
+)
 def apply(
     repos,
     update,
     all_integrated,
     all_submodule,
-    parallel_safe,
     strict,
     recursive,
     no_patches,
@@ -201,9 +218,28 @@ def apply(
     remove_invalid_branches,
     non_interactive,
     no_auto_commit,
+    force,
+    no_fetch,
+    verbose,
+    no_sha_update,
+    migrate_changes,
+    raise_exception,
+    do_not_apply_patches,
+    no_precommits,
 ):
+    if no_precommits:
+        os.environ["GIMERA_NO_PRECOMMITS"] = "1"
+    if verbose:
+        os.environ["GIMERA_VERBOSE"] = "1"
+    if no_sha_update:
+        os.environ["GIMERA_NO_SHA_UPDATE"] = "1"
+    if force:
+        os.environ["GIMERA_FORCE"] = "1"
     if non_interactive:
         os.environ["GIMERA_NON_INTERACTIVE"] = "1"
+        os.environ["GIT_TERMINAL_PROMPT"] = "0"
+    if do_not_apply_patches:
+        os.environ['GIMERA_DO_NOT_APPLY_PATCHES'] = "1"
     if all_integrated and all_submodule:
         _raise_error("Please set either -I or -S")
     ttype = None
@@ -215,470 +251,29 @@ def apply(
     if missing:
         config = Config()
         repos = list(map(lambda x: str(x.path), _get_missing_repos(config)))
-
-    return _apply(
-        repos,
-        update,
-        force_type=ttype,
-        parallel_safe=parallel_safe,
-        strict=strict,
-        recursive=recursive,
-        no_patches=no_patches,
-        remove_invalid_branches=remove_invalid_branches,
-        auto_commit=not no_auto_commit,
-    )
-
-
-def _apply(
-    repos,
-    update,
-    force_type=False,
-    parallel_safe=False,
-    strict=False,
-    recursive=False,
-    no_patches=False,
-    remove_invalid_branches=False,
-    auto_commit=True,
-):
-    """
-    :param repos: user input parameter from commandline
-    :param update: bool - flag from command line
-    """
-    config = Config(force_type=force_type, recursive=recursive)
-
-    repos = list(_strip_paths(repos))
-    for check in repos:
-        if check not in map(
-            lambda x: str(x.path), filter(lambda x: x.enabled, config.repos)
-        ):
-            _raise_error(f"Invalid path: {check}")
-
-    _internal_apply(
-        repos,
-        update,
-        force_type,
-        parallel_safe=parallel_safe,
-        strict=strict,
-        recursive=recursive,
-        no_patches=no_patches,
-        remove_invalid_branches=remove_invalid_branches,
-        auto_commit=auto_commit,
-    )
-
-
-def _internal_apply(
-    repos,
-    update,
-    force_type,
-    parallel_safe=False,
-    strict=False,
-    recursive=False,
-    no_patches=False,
-    common_vars=None,
-    parent_config=None,
-    auto_commit=True,
-    **options,
-):
-    common_vars = common_vars or {}
-    main_repo = Repo(os.getcwd())
-    config = Config(
-        force_type=force_type,
-        recursive=recursive,
-        common_vars=common_vars,
-        parent_config=parent_config,
-    )
-    with main_repo.stay_at_commit(not auto_commit):
-        for repo in config.repos:
-            if not repo.enabled:
-                continue
-            if repos and str(repo.path) not in repos:
-                continue
-            _turn_into_correct_repotype(main_repo, repo, config)
-            if repo.type == REPO_TYPE_SUB:
-                _make_sure_subrepo_is_checked_out(main_repo, repo)
-                _fetch_latest_commit_in_submodule(main_repo, repo, update=update)
-            elif repo.type == REPO_TYPE_INT:
-                if not no_patches:
-                    try:
-                        make_patches(main_repo, repo)
-                    except Exception as ex:
-                        raise
-                        msg = f"Error making patches for: {repo.path}\n\n{ex}"
-                        _raise_error(msg)
-
-                try:
-                    _update_integrated_module(
-                        main_repo, repo, update, parallel_safe, **options
-                    )
-                except Exception as ex:
-                    msg = f"Error updating integrated submodules for: {repo.path}\n\n{ex}"
-                    _raise_error(msg)
-
-                if not strict:
-                    # fatal: refusing to create/use '.git/modules/addons_connector/modules/addons_robot/aaa' in another submodule's git dir
-                    # not submodules inside integrated modules
-                    force_type = REPO_TYPE_INT
-
-            if recursive:
-                common_vars.update(config.yaml_config.get("common", {}).get("vars", {}))
-                _apply_subgimera(
-                    main_repo,
-                    repo,
-                    update,
-                    force_type,
-                    parallel_safe=parallel_safe,
-                    strict=strict,
-                    no_patches=no_patches,
-                    common_vars=common_vars,
-                    parent_config=config,
-                    auto_commit=auto_commit,
-                    **options,
-                )
-
-
-def _apply_subgimera(
-    main_repo,
-    repo,
-    update,
-    force_type,
-    parallel_safe,
-    strict,
-    no_patches,
-    parent_config,
-    **options,
-):
-    subgimera = Path(repo.path) / "gimera.yml"
-    sub_path = main_repo.path / repo.path
-    pwd = os.getcwd()
-    if subgimera.exists():
-        os.chdir(sub_path)
-        _internal_apply(
-            [],
-            update,
-            force_type=force_type,
-            parallel_safe=parallel_safe,
-            strict=strict,
-            recursive=True,
-            no_patches=no_patches,
-            parent_config=parent_config,
-            **options,
-        )
-
-        dirty_files = list(
-            filter(lambda x: safe_relative_to(x, sub_path), main_repo.all_dirty_files)
-        )
-        if dirty_files:
-            main_repo.please_no_staged_files()
-            for f in dirty_files:
-                main_repo.X("git", "add", f)
-            main_repo.X("git", "commit", "-m", f"gimera: updated sub path {repo.path}")
-        # commit submodule updates or changed dirs
-    os.chdir(pwd)
-
-
-def _make_sure_subrepo_is_checked_out(main_repo, repo_yml):
-    """
-    Could be, that git submodule update was not called yet.
-    """
-    assert repo_yml.type == REPO_TYPE_SUB
-    path = main_repo.path / repo_yml.path
-    if path.exists() and not is_empty_dir(path):
-        return
-    main_repo.X(
-        *(git + ["submodule", "update", "--init", "--recursive", repo_yml.path])
-    )
-    if not path.exists():
-        _raise_error("After submodule update the path {repo_yml['path']} did not exist")
-
-
-def _get_cache_dir(main_repo, repo_yml):
-    url = repo_yml.url
-    if not url:
-        click.secho(f"Missing url: {json.dumps(repo_yml, indent=4)}")
-        sys.exit(-1)
-    path = Path(os.path.expanduser("~/.cache/gimera")) / url.replace(":", "_").replace(
-        "/", "_"
-    )
-    path.parent.mkdir(exist_ok=True, parents=True)
-    if not path.exists():
-        click.secho(
-            f"Caching the repository {repo_yml.url} for quicker reuse",
-            fg="yellow",
-        )
-        with prepare_dir(path) as _path:
-            Repo(main_repo.path).X("git", "clone", url, _path)
-    return path
-
-
-def _update_integrated_module(
-    main_repo,
-    repo_yml,
-    update,
-    parallel_safe,
-    **options,
-):
-    """
-    Put contents of a git repository inside the main repository.
-    """
-
-    # TODO eval parallelsafe
-
-    # use a cache directory for pulling the repository and updating it
-    local_repo_dir = _get_cache_dir(main_repo, repo_yml)
-    with wait_git_lock(local_repo_dir):
-        if not os.access(local_repo_dir, os.W_OK):
-            _raise_error(f"No R/W rights on {local_repo_dir}")
-        repo = Repo(local_repo_dir)
-        repo.X("git", "remote", "set-url", "origin", repo_yml.url)
-        repo.X("git", "fetch", "--all")
-        branch = str(repo_yml.branch)
-        origin_branch = f"origin/{branch}"
-        try:
-            repo.X("git", "checkout", "-f", branch)
-        except subprocess.CalledProcessError:
-            if options.get("remove_invalid_branches"):
-                repo_yml.drop_dead()
-                click.secho(
-                    f"Branch {branch} did not exist in {repo_yml.path}; it is removed.",
-                    fg="yellow",
-                )
-            else:
-                click.secho(
-                    f"Branch {branch} does not exist in {repo_yml.path}", fg="red"
-                )
+        if not repos:
+            click.secho("Nothing to do - all paths exist.", fg="green")
             return
-        repo.X("git", "reset", "--hard", origin_branch)
-        repo.X("git", "branch", f"--set-upstream-to={origin_branch}", branch)
-        repo.X("git", "clean", "-xdff")
-        repo.pull(repo_yml=repo_yml)
-
-        if not update and repo_yml.sha:
-            branches = repo.get_all_branches()
-            if repo_yml.branch not in branches:
-                repo.pull(repo_yml=repo_yml)
-                repo_yml.sha = None
-            else:
-                subprocess.check_call(
-                    ["git", "config", "advice.detachedHead", "false"],
-                    cwd=local_repo_dir,
-                )
-                repo.checkout(repo_yml.sha, force=True)
-
-        new_sha = repo.hex
-        with _apply_merges(repo, repo_yml, parallel_safe) as (repo, remote_refs):
-            dest_path = Path(main_repo.path) / repo_yml.path
-            dest_path.parent.mkdir(exist_ok=True, parents=True)
-            # BTW: delete-after cannot removed unused directories - cool to know; is
-            # just standarded out
-            if dest_path.exists():
-                rmtree(dest_path)
-            rsync(repo.path, dest_path, exclude=[".git"])
-            msg = [f"Merged: {repo_yml.url}"]
-            for remote, ref in remote_refs:
-                msg.append(f"Merged {remote.url}:{ref}")
-            main_repo.commit_dir_if_dirty(repo_yml.path, "\n".join(msg))
-
-        del repo
-
-        # apply patches:
-        _apply_patches(
-            repo_yml,
-        )
-        main_repo.commit_dir_if_dirty(
-            repo_yml.path, f"updated {REPO_TYPE_INT} submodule: {repo_yml.path}"
-        )
-        repo_yml.sha = new_sha
-
-        if repo_yml.edit_patchfile:
-            _apply_patchfile(
-                repo_yml.edit_patchfile_full_path, repo_yml.fullpath, error_ok=True
-            )
-
-
-@yieldlist
-def _get_remotes(repo_yml):
-    config = repo_yml.remotes
-    if not config:
-        return
-
-    for name, url in dict(config).items():
-        yield Remote(None, name, url)
-
-
-@contextmanager
-def _apply_merges(repo, repo_yml, parallel_safe):
-    if not repo_yml.merges:
-        yield repo, []
-        # https://stackoverflow.com/questions/6395063/yield-break-in-python
-        return iter([])
 
     try:
-        if parallel_safe:
-            repo2 = tempfile.mktemp(suffix=".")
-            repo.X(
-                "git",
-                "clone",
-                "--branch",
-                str(repo_yml.branch),
-                "file://" + str(repo.path),
-                repo2,
-            )
-            repo = Repo(repo2)
-
-        configured_remotes = _get_remotes(repo_yml)
-        # as we clone into a temp directory to allow parallel actions
-        # we set the origin to the repo source
-        configured_remotes.append(Remote(repo, "origin", repo_yml.url))
-        for remote in configured_remotes:
-            if list(filter(lambda x: x.name == remote.name, repo.remotes)):
-                repo.remove_remote(remote)
-            repo.add_remote(remote)
-
-        remotes = []
-        for remote, ref in repo_yml.merges:
-            remote = [x for x in reversed(configured_remotes) if x.name == remote][0]
-            repo.pull(remote=remote, ref=ref)
-            remotes.append((remote, ref))
-
-        yield repo, remotes
-    finally:
-        if parallel_safe:
-            rmtree(repo.path)
-
-
-def _apply_patchfile(file, working_dir, error_ok=False):
-    cwd = Path(working_dir)
-    # must be check_output due to input keyword
-    # Explaining -R option:
-    #   at testing a patchfile is created ; although not comitting
-    #   git detects, that the file was removed and same patch tries to be applied
-    #   Very intelligent but we force defined state over such smart behaviours.
-    """
-    /tmp/gimeratest/workspace/integrated/sub1/patches/15.0/superpatches/my.patch
-    =============================================================================================
-    patching file file1.txt
-    Reversed (or previously applied) patch detected!  Assume -R? [n]
-    Apply anyway? [n]
-    Skipping patch.
-    1 out of 1 hunk ignored -- saving rejects to file file1.txt.rej
-    """
-    file = Path(file)
-    try:
-        subprocess.check_output(
-            ["patch", "-p1", "--no-backup-if-mismatch", "--force", "-i", str(file)],
-            cwd=cwd,
-            encoding="utf-8",
+        _apply(
+            repos,
+            update,
+            force_type=ttype,
+            strict=strict,
+            recursive=recursive,
+            no_patches=no_patches,
+            remove_invalid_branches=remove_invalid_branches,
+            auto_commit=not no_auto_commit,
+            no_fetch=no_fetch,
+            migrate_changes=migrate_changes,
+            raise_exception=raise_exception,
         )
-        click.secho(
-            (f"Applied patch {file}"),
-            fg="blue",
-        )
-    except subprocess.CalledProcessError as ex:
-        click.secho(
-            ("\n\nFailed to apply the following patch file:\n\n"),
-            fg="yellow",
-        )
-        click.secho(
-            (
-                f"{file}\n"
-                "============================================================================================="
-            ),
-            fg="red",
-            bold=True,
-        )
-        click.secho((f"{ex.stdout or ''}\n" f"{ex.stderr or ''}\n"), fg="yellow")
+    except Exception as ex:
+        from . import snapshot
 
-        click.secho(file.read_text(), fg="cyan")
-        if os.getenv("GIMERA_NON_INTERACTIVE") == "1" or not inquirer.confirm(
-            f"Patchfile failed ''{file}'' - continue with next file?",
-            default=True,
-        ):
-            if not error_ok:
-                _raise_error(f"Error applying patch: {file}")
-    except Exception as ex:  # pylint: disable=broad-except
-        _raise_error(str(ex))
-
-
-def _commit_submodule_inside_clean_but_not_linked_to_parent(main_repo, subrepo):
-    """
-    If the submodule is clean inside but is not committed to the parent
-    repository, this module does that.
-    """
-    if subrepo.dirty:
-        return False
-
-    if not [
-        x for x in main_repo.all_dirty_files if x.absolute() == subrepo.path.absolute()
-    ]:
-        return
-
-    main_repo.X("git", "add", subrepo.path)
-    sha = subrepo.hex
-    main_repo.X(
-        "git",
-        "commit",
-        "-m",
-        (
-            f"gimera: updated submodule at {subrepo.path.relative_to(main_repo.path)} "
-            f"to latest version {sha}"
-        ),
-    )
-
-
-def _fetch_latest_commit_in_submodule(main_repo, repo_yml, update=False):
-    path = Path(main_repo.path) / repo_yml.path
-    if not path.exists():
-        return
-    subrepo = main_repo.get_submodule(repo_yml.path)
-    if subrepo.dirty:
-        _raise_error(
-            f"Directory {repo_yml.path} contains modified "
-            "files. Please commit or purge before!"
-        )
-    sha = repo_yml.sha
-    if sha:
-        try:
-            branches = list(
-                clean_branch_names(
-                    subrepo.out("git", "branch", "--contains", sha).splitlines()
-                )
-            )
-        except Exception:  # pylint: disable=broad-except
-            _raise_error(
-                f"SHA {sha} does not seem to belong to a "
-                f"branch at module {repo_yml.path}"
-            )
-
-        if not [x for x in branches if repo_yml.branch == x]:
-            _raise_error(
-                f"SHA {sha} does not exist on branch "
-                f"{repo_yml.branch} at repo {repo_yml.path}"
-            )
-        sha_of_branch = subrepo.out("git", "rev-parse", repo_yml.branch).strip()
-        if sha_of_branch == sha:
-            subrepo.X("git", "checkout", "-f", repo_yml.branch)
-        else:
-            subrepo.X("git", "checkout", "-f", sha)
-    else:
-        try:
-            subrepo.X("git", "checkout", "-f", repo_yml.branch)
-        except Exception:  # pylint: disable=broad-except
-            _raise_error(f"Failed to checkout {repo_yml.branch} in {path}")
-        else:
-            _commit_submodule_inside_clean_but_not_linked_to_parent(main_repo, subrepo)
-
-    subrepo.X("git", "submodule", "update", "--init", "--recursive")
-    _commit_submodule_inside_clean_but_not_linked_to_parent(main_repo, subrepo)
-
-    # check if sha collides with branch
-    subrepo.X("git", "clean", "-xdff")
-    if not repo_yml.sha or update:
-        subrepo.X("git", "checkout", "-f", repo_yml.branch)
-        subrepo.pull(repo_yml=repo_yml)
-        _commit_submodule_inside_clean_but_not_linked_to_parent(main_repo, subrepo)
-
-    # update gimera.yml on demand
-    repo_yml.sha = subrepo.hex
+        snapshot.cleanup()
+        raise
 
 
 def clean_branch_names(arr):
@@ -687,97 +282,6 @@ def clean_branch_names(arr):
         if x.startswith("* "):
             x = x[2:]
         yield x
-
-
-def __add_submodule(repo, config, all_config):
-    if config.type != REPO_TYPE_SUB:
-        return
-    path = repo.path / config.path
-    relpath = path.relative_to(repo.path)
-    if path.exists():
-        # if it is already a submodule, dont touch
-        try:
-            submodule = repo.get_submodule(relpath)
-        except ValueError:
-            repo.output_status()
-            repo.please_no_staged_files()
-            # remove current path
-
-            if repo.lsfiles(relpath):
-                repo.X("git", "rm", "-f", "-r", relpath)
-            if (repo.path / relpath).exists():
-                rmtree(repo.path / relpath)
-
-            repo.clear_empty_subpaths(config)
-            repo.output_status()
-            if not [
-                # x for x in repo.staged_files if safe_relative_to(x, repo.path / relpath)
-                x
-                for x in repo.all_dirty_files
-                if safe_relative_to(x, repo.path / relpath)
-            ]:
-                if relpath.exists():
-                    # in case of deletion it does not exist
-                    repo.X("git", "add", relpath)
-            if repo.staged_files:
-                repo.X(
-                    "git", "commit", "-m", f"removed path {relpath} to insert submodule"
-                )
-
-            # make sure does not exist; some leftovers sometimes
-            repo.force_remove_submodule(relpath)
-
-        else:
-            # if submodule points to another url, also remove
-            if submodule.get_url(noerror=True) != config.url:
-                repo.force_remove_submodule(submodule.path.relative_to(repo.path))
-            else:
-                return
-    else:
-        repo.force_remove_submodule(relpath)
-
-    repo._fix_to_remove_subdirectories(all_config)
-    if (repo.path / relpath).exists():
-        # helped in a in the wild repo, where a submodule was hidden below
-        repo.X("git", "rm", "-rf", relpath)
-        rmtree(repo.path / relpath)
-
-    repo.submodule_add(config.branch, config.url, relpath)
-    # repo.X("git", "add", ".gitmodules", relpath)
-    click.secho(f"Added submodule {relpath} pointing to {config.url}", fg="yellow")
-    if repo.staged_files:
-        repo.X("git", "commit", "-m", f"gimera added submodule: {relpath}")
-
-
-def _turn_into_correct_repotype(repo, repo_config, config):
-    """
-    if git submodule and exists: nothing todo
-    if git submodule and not exists: cloned
-    if git submodule and already exists a path: path removed, submodule added
-
-    if integrated and exists no sub: nothing todo
-    if integrated and not exists: cloned (later not here)
-    if integrated and git submodule and already exists a path: submodule removed
-
-    """
-    path = repo_config.path
-    if repo_config.type == REPO_TYPE_INT:
-        # always delete
-        submodules = repo.get_submodules()
-        existing_submodules = list(
-            filter(lambda x: x.equals(repo.path / path), submodules)
-        )
-        if existing_submodules:
-            repo.force_remove_submodule(path)
-    else:
-        __add_submodule(repo, repo_config, config)
-        submodules = repo.get_submodules()
-        existing_submodules = list(
-            filter(lambda x: x.equals(repo.path / path), submodules)
-        )
-        if not existing_submodules:
-            _raise_error(f"Error with submodule {path}")
-        del existing_submodules
 
 
 @cli.command()
@@ -825,7 +329,7 @@ def add(url, branch, path, type):
     config = Config()
     repos = config.repos
     for repo in repos:
-        if repo.path == path:
+        if str(repo.path) == path:
             config._store(repo, data)
             break
     else:
@@ -878,74 +382,107 @@ def abort():
             )
 
 
-def _get_repo_to_patchfiles(patchfiles):
-    for patchfile in patchfiles:
-        patchfile = Path(patchfile)
-        if patchfile.exists() and str(patchfile).startswith("/"):
-            patchfile = str(patchfile.relative_to(Path(os.getcwd())))
-        patchfile = _get_available_patchfiles(None, None, str(patchfile))
-        if not patchfile:
-            _raise_error(f"Not found: {patchfile}")
-        if len(patchfile) > 1:
-            _raise_error(f"Too many patchfiles found: {patchfile}")
-
-        cwd = Path(os.getcwd())
-        patchfile = cwd / patchfile[0]
-        config = Config(force_type=False)
-
-        def _get_repo_of_patchfile():
-            for repo in config.repos:
-                if not repo.enabled:
-                    continue
-                patch_dirs = repo.all_patch_dirs(rel_or_abs="absolute")
-                if not patch_dirs:
-                    continue
-                for patchdir in patch_dirs:
-                    path = patchdir._path
-                    for file in path.glob("*.patch"):
-                        if file == patchfile:
-                            return repo
-
-        repo = _get_repo_of_patchfile()
-        if not repo:
-            _raise_error(f"Repo not found for {patchfile}")
-
-        if repo.type != REPO_TYPE_INT:
-            _raise_error(f"Repo {repo.path} is not integrated")
-        yield (repo, patchfile)
-
-
-def _edit_patch(patchfiles):
-    patchfiles = list(sorted(set(patchfiles)))
-    for patchfile in list(_get_repo_to_patchfiles(patchfiles)):
-        repo, patchfile = patchfile
-        if repo.edit_patchfile:
-            _raise_error(f"Already WIP for patchfile: {repo.edit_patchfile}")
-        try:
-            repo.edit_patchfile = str(patchfile.relative_to(repo.fullpath))
-        except ValueError:
-            repo.edit_patchfile = patchfile.relative_to(repo.config.config_file.parent)
-        repo.config._store(
-            repo,
-            {
-                "edit_patchfile": str(repo.edit_patchfile),
-            },
-        )
-        break
-    _internal_apply(str(repo.path), update=False, force_type=None)
-
-
-def _get_missing_repos(config):
-    for repo in config.repos:
-        if not repo.enabled:
-            continue
-        if not repo.path.exists():
-            yield repo
-
-
 @cli.command()
 def status():
     config = Config()
     repos = list(_get_missing_repos(config))
     for repo in repos:
-        click.secho(f"Missing: {repo.path}", fg="red")
+        click.secho(f"[{repo.type[0].upper()}] {repo.path}", fg="red")
+    main_repo = _get_main_repo()
+    for repo in config.get_repos(None):
+        full_path = main_repo.path / repo.path
+        if not full_path.exists():
+            continue
+        eff_S = bool(main_repo.is_path_a_submodule(repo.path))
+        deviates = (
+            repo.type == REPO_TYPE_INT
+            and eff_S
+            or repo.type == REPO_TYPE_SUB
+            and not eff_S
+        )
+        text = f"[{repo.type[0].upper()}] {repo.path}"
+        if deviates:
+            text += " IS NOW " + ("submodule" if eff_S else "integrated")
+        click.secho(text, fg="green" if not deviates else "yellow")
+
+
+@cli.command(
+    name="commit", help="Collects changes and commits them to the specified branch."
+)
+@click.argument(
+    "repo", default=None, shell_complete=_get_available_repos, required=True
+)
+@click.argument("message", required=True)
+@click.option(
+    "-p",
+    "--preview",
+    is_flag=True,
+)
+@click.argument("branch", required=False)
+def commit(repo, branch, message, preview):
+    return _commit(repo, branch, message, preview)
+
+
+@cli.command(help="Removes all dirty")
+def purge():
+    config = Config()
+    repos = config.get_repos(None)
+    for repo in repos:
+        click.secho(f"Deleting: {repo.path}")
+        try_rm_tree(repo.path)
+
+
+@cli.command()
+def list_snapshots():
+    from .snapshot import list_snapshots
+
+    main_repo = _get_main_repo()
+
+    for snap in reversed(list(list_snapshots(main_repo.path))):
+        click.secho(snap, fg="green")
+
+
+@cli.command()
+@click.argument("name", required=True)
+@click.argument("repos", nargs=-1, default=None, shell_complete=_get_available_repos)
+def snap(name, repos):
+    from .snapshot import snapshot_recursive
+
+    os.environ["GIMERA_TOKEN"] = datetime.now().strftime(f"%Y-%m-%d-%H%M%S-{name}")
+    main_repo = _get_main_repo()
+    if not repos:
+        config = Config()
+        repos = [x.path for x in config.get_repos(None) if x.path.exists()]
+    else:
+        repos = list(_expand_repos(repos))
+    token = snapshot_recursive(
+        main_repo.path, [main_repo.path / repo for repo in repos]
+    )
+    click.secho(f"Snapshot stored under token: {token}", fg="green")
+
+
+@cli.command()
+@click.argument("repos", nargs=-1, default=None, shell_complete=_get_available_repos)
+def snaprestore(repos):
+    from .snapshot import snapshot_restore
+    from .snapshot import get_snapshots
+
+    main_repo = _get_main_repo()
+    snapshots = get_snapshots(main_repo.path)
+    token = inquirer.prompt(
+        [
+            inquirer.List(
+                "snapshot",
+                "Choose snapshot",
+                default=True,
+                choices=snapshots,
+            )
+        ]
+    )["snapshot"]
+    filter_repos = []
+    if repos:
+        repos = list(_expand_repos(repos))
+        for repo in repos:
+            filter_repos.append(str(repo))
+
+    snapshot_restore(main_repo.path, filter_repos, token=token)
